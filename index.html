@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Boost CRM</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+  <!-- Firebase -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script>
+    firebase.initializeApp({
+      apiKey: "AIzaSyAxIBw5nEA1_eFoDihV09eDpXsMCYdmlSo",
+      authDomain: "crm-jsport.firebaseapp.com",
+      projectId: "crm-jsport",
+      storageBucket: "crm-jsport.firebasestorage.app",
+      messagingSenderId: "9540685659",
+      appId: "1:9540685659:web:ff4c58b8582da9fcad147e"
+    });
+    window.db   = firebase.firestore();
+    window.auth = firebase.auth();
+  </script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const emptyBranch = () => ({ newLeads: [], noAnswer: [], followUp: [], intros: [], memberships: [], cancellations: [], freezes: [] });
+    const emptyDay = () => ({ afula: emptyBranch(), migdalHaemek: emptyBranch(), global: { other: [], tasks: [] } });
+
+    // מוגדר מחוץ ל-App כדי שלא יתאפס בכל רנדר
+    const FreeText = ({ value, onChange, options, placeholder }) => {
+      const isFree = !!value && !options.includes(value);
+      const [mode, setMode] = useState(isFree ? 'free' : 'select');
+
+      if (mode === 'select') {
+        return (
+          <select
+            value={value || ''}
+            onChange={e => {
+              if (e.target.value === '__free__') {
+                setMode('free');
+                onChange('');
+              } else {
+                onChange(e.target.value);
+              }
+            }}
+            className="flex-1 border border-gray-300 rounded-md p-2 text-sm bg-white focus:border-blue-500 focus:outline-none"
+          >
+            <option value="">{placeholder || 'בחרי...'}</option>
+            {options.map(o => <option key={o} value={o}>{o}</option>)}
+            <option value="__free__">✏️ מלל חופשי...</option>
+          </select>
+        );
+      }
+
+      return (
+        <div className="flex gap-1 flex-1">
+          <input
+            autoFocus
+            type="text"
+            value={value || ''}
+            onChange={e => onChange(e.target.value)}
+            placeholder="כתבי כאן בחופשיות..."
+            className="flex-1 border border-purple-400 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-200"
+          />
+          <button
+            type="button"
+            onClick={() => { setMode('select'); onChange(''); }}
+            className="px-2 border border-gray-300 rounded-md bg-white text-gray-400 hover:bg-gray-100 text-xs flex-shrink-0"
+            title="חזרה לרשימה">↩</button>
+        </div>
+      );
+    };
+
+    function App({ onLogout }) {
+      const [currentDate, setCurrentDate] = useState(new Date().toISOString().split('T')[0]);
+      const [activeTab, setActiveTab] = useState('data');
+      const [activeBranch, setActiveBranch] = useState('afula');
+      const [dayData, setDayData] = useState(emptyDay());
+      const [saveStatus, setSaveStatus] = useState('idle'); // 'idle' | 'saving' | 'saved' | 'unsaved'
+      const [loading, setLoading] = useState(true);
+      const saveTimer    = useRef(null);
+      const unsubRef     = useRef(null);
+      const fromCloud    = useRef(true);  // השינוי הגיע מ-Firestore?
+      const dirtyBranches = useRef(new Set()); // אילו חלקים שונו מקומית
+      const dayDataRef   = useRef(emptyDay()); // תמיד מעודכן לגרסה האחרונה
+
+      // עדכן ref בכל שינוי state
+      useEffect(() => { dayDataRef.current = dayData; }, [dayData]);
+
+      // טעינה בזמן אמת מ-Firestore בכל שינוי תאריך
+      useEffect(() => {
+        setLoading(true);
+        setSaveStatus('idle');
+        dirtyBranches.current.clear();
+        if (unsubRef.current) unsubRef.current();
+        const unsub = window.db.collection('reports').doc(currentDate)
+          .onSnapshot(snap => {
+            const cloudData = snap.exists ? snap.data() : emptyDay();
+            fromCloud.current = true;
+            setDayData(prev => {
+              // שמר גרסה מקומית לכל חלק שנערך מקומית, עדכן את השאר מהענן
+              const merged = { ...cloudData };
+              for (const b of dirtyBranches.current) {
+                merged[b] = prev[b];
+              }
+              return merged;
+            });
+            setLoading(false);
+          }, err => {
+            console.error('Firestore error:', err);
+            setLoading(false);
+          });
+        unsubRef.current = unsub;
+        return () => unsub();
+      }, [currentDate]);
+
+      // שמירה אוטומטית כשהמשתמש שינה (לא כשהענן עדכן)
+      useEffect(() => {
+        if (fromCloud.current) {
+          fromCloud.current = false;
+          if (dirtyBranches.current.size === 0) {
+            // אין שינויים מקומיים – בטל שמירה ממתינה
+            clearTimeout(saveTimer.current);
+            setSaveStatus('saved');
+          }
+          // אם יש שינויים מקומיים, המשך את הטיימר כדי לשמור אותם
+          return;
+        }
+        setSaveStatus('unsaved');
+        clearTimeout(saveTimer.current);
+        saveTimer.current = setTimeout(() => saveData(), 2000);
+      }, [dayData]);
+
+      const saveData = async () => {
+        if (dirtyBranches.current.size === 0) return;
+        setSaveStatus('saving');
+        try {
+          // בנה אובייקט עם רק החלקים שנערכו מקומית
+          const toSave = {};
+          const current = dayDataRef.current;
+          for (const b of dirtyBranches.current) {
+            toSave[b] = current[b];
+          }
+          // merge:true שומר רק את השדות שצוינו ולא מוחק שדות שעדכן משתמש אחר
+          await window.db.collection('reports').doc(currentDate).set(toSave, { merge: true });
+          dirtyBranches.current.clear();
+          setSaveStatus('saved');
+          clearTimeout(saveTimer.current);
+          saveTimer.current = setTimeout(() => setSaveStatus('idle'), 3000);
+        } catch(e) {
+          console.error('Save error:', e);
+          setSaveStatus('unsaved');
+          alert('שגיאה בשמירה לענן: ' + e.message);
+        }
+      };
+
+      // פורמט תאריך מ-YYYY-MM-DD ל-DD/MM
+      const fmtDate = (d) => {
+        if (!d) return '';
+        const parts = d.split('-');
+        if (parts.length === 3) return `${parts[2]}/${parts[1]}`;
+        return d;
+      };
+
+      const day = dayData;
+
+      const markDirty = (branch) => {
+        dirtyBranches.current.add(branch === 'global' ? 'global' : branch);
+        fromCloud.current = false;
+      };
+
+      const updateField = (branch, cat, id, field, value) => {
+        markDirty(branch);
+        setDayData(prev => {
+          const d = JSON.parse(JSON.stringify(prev));
+          const list = branch === 'global' ? d.global[cat] : d[branch][cat];
+          const idx = list.findIndex(i => i.id === id);
+          if (idx > -1) list[idx][field] = value;
+          return d;
+        });
+      };
+
+      const addItem = (branch, cat, def) => {
+        markDirty(branch);
+        setDayData(prev => {
+          const d = JSON.parse(JSON.stringify(prev));
+          const item = { id: Date.now(), ...def };
+          if (branch === 'global') d.global[cat].push(item);
+          else d[branch][cat].push(item);
+          return d;
+        });
+      };
+
+      const removeItem = (branch, cat, id) => {
+        markDirty(branch);
+        setDayData(prev => {
+          const d = JSON.parse(JSON.stringify(prev));
+          if (branch === 'global') d.global[cat] = d.global[cat].filter(i => i.id !== id);
+          else d[branch][cat] = d[branch][cat].filter(i => i.id !== id);
+          return d;
+        });
+      };
+
+      const exportToCSV = () => {
+        let csv = "\uFEFF";
+        csv += `דוח יומי - סטודיו, תאריך: ${currentDate}\n\n`;
+        const sec = (title, list, fn) => { if (list?.length) { csv += title + '\n'; list.forEach(i => { csv += fn(i) + '\n'; }); csv += '\n'; } };
+        ['afula','migdalHaemek'].forEach(b => {
+          csv += `--- סניף ${b==='afula'?'עפולה':'מגדל העמק'} ---\n`;
+          sec("לידים (דיברו)", dayData[b]?.newLeads, i=>`${i.name},${i.status||''}`);
+          sec("לידים (לא ענו)", dayData[b]?.noAnswer, i=>i.name);
+          sec("Follow Up", dayData[b]?.followUp, i=>`${i.name},${i.status||''}`);
+          sec("אימוני היכרות", dayData[b]?.intros, i=>`${i.name},${fmtDate(i.date)},${i.type||''},${i.trainer||''}`);
+          sec("מנויים חדשים", dayData[b]?.memberships, i=>i.name);
+          sec("ביטולים", dayData[b]?.cancellations, i=>`${i.name},${i.reason||''}`);
+          sec("הקפאות", dayData[b]?.freezes, i=>`${i.name},${i.reason||''}`);
+        });
+        sec("אחר", dayData.global?.other, i=>i.text);
+        sec("משימות", dayData.global?.tasks, i=>`${i.name},${i.desc||''}`);
+        const link = document.createElement('a');
+        link.href = 'data:text/csv;charset=utf-8,' + encodeURI(csv);
+        link.download = `crm_${currentDate}.csv`;
+        link.click();
+      };
+
+      const leadStatuses = ['לדבר מחר','רוצה לחשוב על זה','להתייעץ עם הבעל','צריכה לבדוק משמרות','סיבה רפואית','לא רלוונטי'];
+      const cancelReasons = ['מצב כלכלי','מעבר לחדר כושר','חוסר מוטיבציה','סיבה רפואית','מעבר דירה','חוסר זמן'];
+      const workoutTypes = ['פאוור','פילאטיס','עיצוב וחיטוב','אימון אישי','קנגו'];
+      const trainers = ['יסמין','לירון','שירן','אחר'];
+
+
+      // Sel נשאר למאמנות בלבד (רשימה סגורה)
+      const Sel = ({ value, onChange, options, placeholder }) => (
+        <select value={value||''} onChange={e=>onChange(e.target.value)}
+          className="border border-gray-300 rounded-md p-2 text-sm bg-white focus:border-blue-500">
+          <option value="" disabled>{placeholder||'בחר...'}</option>
+          {options.map(o=><option key={o} value={o}>{o}</option>)}
+        </select>
+      );
+
+      const SectionHead = ({ title, color }) => (
+        <div className={`flex items-center gap-2 mb-4 pb-2 border-b-2 ${color} font-bold text-lg`}>{title}</div>
+      );
+
+      const Btn = ({ onClick, children, color='text-blue-600' }) => (
+        <button onClick={onClick} className={`${color} text-sm flex items-center gap-1 hover:underline mt-2`}>
+          <span className="text-base font-bold">+</span> {children}
+        </button>
+      );
+
+      const Del = ({ onClick }) => (
+        <button onClick={onClick} className="text-red-400 hover:text-red-600 p-1 flex-shrink-0">✕</button>
+      );
+
+      const b = day[activeBranch];
+
+      if (loading) return (
+        <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+          <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-gray-500 font-medium">טוען נתונים מהענן...</p>
+        </div>
+      );
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          {/* Header */}
+          <header className="bg-slate-900 text-white p-4 shadow-md sticky top-0 z-10">
+            <div className="max-w-6xl mx-auto flex flex-wrap justify-between items-center gap-4">
+              <div>
+                <h1 className="text-2xl font-bold"><span className="text-blue-400">Boost</span> CRM</h1>
+                <p className="text-slate-400 text-sm">ניהול דוחות יומי - גיא ויסמין</p>
+              </div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <input type="date" value={currentDate} onChange={e=>setCurrentDate(e.target.value)}
+                  className="bg-slate-800 text-white border border-slate-600 rounded-lg px-3 py-2 cursor-pointer" />
+                <button onClick={() => saveData()}
+                  disabled={saveStatus === 'saving'}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all text-sm ${
+                    saveStatus === 'saved'   ? 'bg-green-500 text-white' :
+                    saveStatus === 'unsaved' ? 'bg-yellow-400 text-yellow-900 animate-pulse' :
+                    saveStatus === 'saving'  ? 'bg-slate-500 text-white cursor-wait' :
+                                              'bg-slate-600 text-white hover:bg-slate-500'
+                  }`}>
+                  {saveStatus === 'saved'   ? '✓ נשמר בענן!' :
+                   saveStatus === 'unsaved' ? '💾 שמור שינויים' :
+                   saveStatus === 'saving'  ? '⏳ שומר...' : '💾 שמור'}
+                </button>
+                <button onClick={exportToCSV}
+                  className="flex items-center gap-2 bg-green-600 hover:bg-green-500 px-4 py-2 rounded-lg font-medium transition-colors text-sm">
+                  ⬇ CSV
+                </button>
+                <button onClick={onLogout}
+                  className="flex items-center gap-2 bg-red-700 hover:bg-red-600 px-3 py-2 rounded-lg font-medium transition-colors text-sm text-white">
+                  יציאה
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto p-4">
+            {/* Tabs */}
+            <div className="flex bg-gray-200 p-1 rounded-xl mb-6 gap-1">
+              <button onClick={()=>setActiveTab('data')}
+                className={`flex-1 py-2.5 text-sm font-bold rounded-lg transition-all ${activeTab==='data'?'bg-white text-blue-700 shadow':'text-gray-600'}`}>
+                📋 הזנת נתונים
+              </button>
+              <button onClick={()=>setActiveTab('summary')}
+                className={`flex-1 py-2.5 text-sm font-bold rounded-lg transition-all ${activeTab==='summary'?'bg-white text-blue-700 shadow':'text-gray-600'}`}>
+                📊 סיכום יומי
+              </button>
+            </div>
+
+            {activeTab === 'data' && (
+              <div>
+                {/* Branch Selector */}
+                <div className="flex justify-center mb-6">
+                  <div className="inline-flex rounded-md shadow-sm">
+                    <button onClick={()=>setActiveBranch('afula')}
+                      className={`px-8 py-3 text-sm font-bold border border-gray-200 rounded-r-lg ${activeBranch==='afula'?'bg-blue-600 text-white':'bg-white text-gray-900 hover:bg-gray-100'}`}>
+                      סניף עפולה
+                    </button>
+                    <button onClick={()=>setActiveBranch('migdalHaemek')}
+                      className={`px-8 py-3 text-sm font-bold border border-l-0 border-gray-200 rounded-l-lg ${activeBranch==='migdalHaemek'?'bg-blue-600 text-white':'bg-white text-gray-900 hover:bg-gray-100'}`}>
+                      סניף מגדל העמק
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* עמודה שמאל - לידים */}
+                  <div className="space-y-6">
+
+                    {/* לידים שדיברו */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                      <SectionHead title="👥 לידים חדשים (דיברו)" color="border-blue-200 text-blue-700" />
+                      <div className="space-y-3">
+                        {b.newLeads.map(lead => (
+                          <div key={lead.id} className="flex gap-2 items-center">
+                            <input type="text" placeholder="שם הליד" value={lead.name}
+                              onChange={e=>updateField(activeBranch,'newLeads',lead.id,'name',e.target.value)}
+                              className="flex-1 p-2 border rounded text-sm" />
+                            <FreeText value={lead.status} options={leadStatuses} placeholder="סטטוס / הערה..." onChange={v=>updateField(activeBranch,'newLeads',lead.id,'status',v)} />
+                            <Del onClick={()=>removeItem(activeBranch,'newLeads',lead.id)} />
+                          </div>
+                        ))}
+                        <Btn onClick={()=>addItem(activeBranch,'newLeads',{name:'',status:''})}>הוסף ליד</Btn>
+                      </div>
+                    </div>
+
+                    {/* לא ענו */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                      <SectionHead title="📵 לידים (לא ענו)" color="border-orange-200 text-orange-700" />
+                      <div className="space-y-3">
+                        {b.noAnswer.map(lead => (
+                          <div key={lead.id} className="flex gap-2 items-center">
+                            <input type="text" placeholder="שם הליד" value={lead.name}
+                              onChange={e=>updateField(activeBranch,'noAnswer',lead.id,'name',e.target.value)}
+                              className="flex-1 p-2 border rounded text-sm" />
+                            <span className="text-xs text-gray-500 bg-gray-100 px-3 py-2 rounded whitespace-nowrap">לא ענתה</span>
+                            <Del onClick={()=>removeItem(activeBranch,'noAnswer',lead.id)} />
+                          </div>
+                        ))}
+                        <Btn onClick={()=>addItem(activeBranch,'noAnswer',{name:''})}>הוסף ליד</Btn>
+                      </div>
+                    </div>
+
+                    {/* Follow Up */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                      <SectionHead title="📞 Follow Up" color="border-purple-200 text-purple-700" />
+                      <div className="space-y-3">
+                        {b.followUp.map(lead => (
+                          <div key={lead.id} className="flex flex-wrap gap-2">
+                            <input type="text" placeholder="שם מיום קודם" value={lead.name}
+                              onChange={e=>updateField(activeBranch,'followUp',lead.id,'name',e.target.value)}
+                              className="flex-1 p-2 border rounded text-sm min-w-32" />
+                            <FreeText value={lead.status} options={leadStatuses} placeholder="סטטוס / הערה..." onChange={v=>updateField(activeBranch,'followUp',lead.id,'status',v)} />
+                            <Del onClick={()=>removeItem(activeBranch,'followUp',lead.id)} />
+                          </div>
+                        ))}
+                        <Btn onClick={()=>addItem(activeBranch,'followUp',{name:'',status:''})}>הוסף Follow Up</Btn>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* עמודה ימין - המרות וביטולים */}
+                  <div className="space-y-6">
+
+                    {/* אימוני היכרות */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-green-100">
+                      <SectionHead title="✅ אימוני היכרות" color="border-green-200 text-green-700" />
+                      <div className="space-y-3">
+                        {b.intros.map(intro => (
+                          <div key={intro.id} className="bg-green-50 p-3 rounded-lg border border-green-100">
+                            <div className="flex justify-between items-center mb-2 gap-2">
+                              <input type="text" placeholder="שם הלקוחה" value={intro.name}
+                                onChange={e=>updateField(activeBranch,'intros',intro.id,'name',e.target.value)}
+                                className="flex-1 p-1.5 border rounded text-sm font-bold" />
+                              <Del onClick={()=>removeItem(activeBranch,'intros',intro.id)} />
+                            </div>
+                            <div className="grid grid-cols-1 gap-2">
+                              <div className="flex flex-col gap-1">
+                                <label className="text-xs text-gray-500 font-medium">📅 תאריך אימון</label>
+                                <input type="date" value={intro.date || ''}
+                                  onChange={e=>updateField(activeBranch,'intros',intro.id,'date',e.target.value)}
+                                  className="p-1.5 border rounded text-sm bg-white w-full cursor-pointer" />
+                              </div>
+                              <div className="flex gap-2">
+                                <div className="flex flex-col gap-1 flex-1">
+                                  <label className="text-xs text-gray-500 font-medium">🏋️ סוג אימון</label>
+                                  <input type="text" placeholder="פאוור / פילאטיס / קנגו..." value={intro.type || ''}
+                                    onChange={e=>updateField(activeBranch,'intros',intro.id,'type',e.target.value)}
+                                    className="p-1.5 border rounded text-sm bg-white w-full" />
+                                </div>
+                                <div className="flex flex-col gap-1 flex-1">
+                                  <label className="text-xs text-gray-500 font-medium">👤 מאמנת</label>
+                                  <Sel value={intro.trainer} options={trainers} placeholder="בחרי"
+                                    onChange={v=>updateField(activeBranch,'intros',intro.id,'trainer',v)} />
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                        <Btn onClick={()=>addItem(activeBranch,'intros',{name:'',date:'',type:'',trainer:''})}>תיאום אימון היכרות</Btn>
+                      </div>
+                    </div>
+
+                    {/* מנויים חדשים */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-emerald-100">
+                      <SectionHead title="🎉 המרות למנויים!" color="border-emerald-200 text-emerald-800" />
+                      <div className="space-y-2">
+                        {b.memberships.map(m => (
+                          <div key={m.id} className="flex gap-2 items-center bg-emerald-50 p-2 rounded border border-emerald-100">
+                            <span className="text-emerald-600 font-bold">✓</span>
+                            <input type="text" placeholder="שם המנויה החדשה" value={m.name}
+                              onChange={e=>updateField(activeBranch,'memberships',m.id,'name',e.target.value)}
+                              className="flex-1 p-1 border-none bg-transparent text-emerald-900 font-medium focus:outline-none" />
+                            <Del onClick={()=>removeItem(activeBranch,'memberships',m.id)} />
+                          </div>
+                        ))}
+                        <Btn color="text-emerald-700" onClick={()=>addItem(activeBranch,'memberships',{name:''})}>הוסף מנויה חדשה</Btn>
+                      </div>
+                    </div>
+
+                    {/* ביטולים */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-red-100">
+                      <SectionHead title="❌ ביטולים והקפאות" color="border-red-200 text-red-700" />
+                      <p className="text-xs font-bold text-gray-500 mb-2">ביטולים</p>
+                      <div className="space-y-2 mb-4">
+                        {b.cancellations.map(item => (
+                          <div key={item.id} className="flex flex-wrap gap-2">
+                            <input type="text" placeholder="שם המתאמנת" value={item.name}
+                              onChange={e=>updateField(activeBranch,'cancellations',item.id,'name',e.target.value)}
+                              className="flex-1 p-2 border rounded bg-red-50 text-sm min-w-32" />
+                            <FreeText value={item.reason} options={cancelReasons} placeholder="סיבה / פירוט..."
+                              onChange={v=>updateField(activeBranch,'cancellations',item.id,'reason',v)} />
+                            <Del onClick={()=>removeItem(activeBranch,'cancellations',item.id)} />
+                          </div>
+                        ))}
+                        <Btn color="text-red-600" onClick={()=>addItem(activeBranch,'cancellations',{name:'',reason:''})}>הוסף ביטול</Btn>
+                      </div>
+                      <p className="text-xs font-bold text-gray-500 mb-2">הקפאות</p>
+                      <div className="space-y-2">
+                        {b.freezes.map(item => (
+                          <div key={item.id} className="flex flex-wrap gap-2">
+                            <input type="text" placeholder="שם המתאמנת" value={item.name}
+                              onChange={e=>updateField(activeBranch,'freezes',item.id,'name',e.target.value)}
+                              className="flex-1 p-2 border rounded bg-yellow-50 text-sm min-w-32" />
+                            <input type="text" placeholder="סיבה" value={item.reason}
+                              onChange={e=>updateField(activeBranch,'freezes',item.id,'reason',e.target.value)}
+                              className="flex-1 p-2 border rounded text-sm min-w-32" />
+                            <Del onClick={()=>removeItem(activeBranch,'freezes',item.id)} />
+                          </div>
+                        ))}
+                        <Btn color="text-yellow-600" onClick={()=>addItem(activeBranch,'freezes',{name:'',reason:''})}>הוסף הקפאה</Btn>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* אזור כללי */}
+                <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6 border-t-2 border-gray-200 pt-6">
+                  <div className="bg-slate-800 text-white p-5 rounded-xl">
+                    <div className="font-bold text-lg mb-1 border-b border-slate-600 pb-2">💬 אחר / בקשות מיוחדות</div>
+                    <p className="text-xs text-slate-400 mb-3">שינויי לו"ז, ביקוש לציוד...</p>
+                    <div className="space-y-3">
+                      {day.global.other.map(item => (
+                        <div key={item.id} className="flex gap-2">
+                          <textarea rows="2" placeholder="פירוט..." value={item.text}
+                            onChange={e=>updateField('global','other',item.id,'text',e.target.value)}
+                            className="flex-1 p-2 rounded bg-slate-700 border border-slate-600 text-white text-sm resize-none" />
+                          <Del onClick={()=>removeItem('global','other',item.id)} />
+                        </div>
+                      ))}
+                      <Btn color="text-blue-300" onClick={()=>addItem('global','other',{text:''})}>הוסף הערה</Btn>
+                    </div>
+                  </div>
+                  <div className="bg-blue-900 text-white p-5 rounded-xl">
+                    <div className="font-bold text-lg mb-1 border-b border-blue-700 pb-2">📌 משימות - גיא ויסמין</div>
+                    <p className="text-xs text-blue-300 mb-3">ייעוץ, תזונה, שימור...</p>
+                    <div className="space-y-3">
+                      {day.global.tasks.map(task => (
+                        <div key={task.id} className="bg-blue-800 p-3 rounded">
+                          <div className="flex justify-between mb-2">
+                            <input type="text" placeholder="שם המתאמנת" value={task.name}
+                              onChange={e=>updateField('global','tasks',task.id,'name',e.target.value)}
+                              className="flex-1 p-1 rounded bg-blue-700 text-white text-sm border-none focus:outline-none ml-2" />
+                            <Del onClick={()=>removeItem('global','tasks',task.id)} />
+                          </div>
+                          <input type="text" placeholder="מה צריך לעשות?" value={task.desc}
+                            onChange={e=>updateField('global','tasks',task.id,'desc',e.target.value)}
+                            className="w-full p-2 rounded bg-blue-700/50 border border-blue-600 text-white text-sm focus:outline-none" />
+                        </div>
+                      ))}
+                      <Btn color="text-blue-300" onClick={()=>addItem('global','tasks',{name:'',desc:''})}>הוסף משימה</Btn>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* סיכום */}
+            {activeTab === 'summary' && (() => {
+              const af = day.afula;
+              const mg = day.migdalHaemek;
+              const fmt = (d) => { const [y,m,dd]=d.split('-'); return `${dd}/${m}/${y}`; };
+              const totalMembers = af.memberships.length + mg.memberships.length;
+              const totalIntros   = af.intros.length   + mg.intros.length;
+              const totalLeadsAf  = af.newLeads.length + af.noAnswer.length + af.followUp.length;
+              const totalLeadsMg  = mg.newLeads.length + mg.noAnswer.length + mg.followUp.length;
+              const totalCancel   = af.cancellations.length + mg.cancellations.length;
+              const totalFreeze   = af.freezes.length + mg.freezes.length;
+
+              // בניית טקסט דוח להעתקה
+              const buildReport = () => {
+                let t = `📊 *דוח יומי - Boost Studio*\n📅 ${fmt(currentDate)}\n`;
+                t += `${'─'.repeat(28)}\n\n`;
+                ['afula','migdalHaemek'].forEach(bk => {
+                  const bd = day[bk];
+                  const bn = bk==='afula' ? 'עפולה' : 'מגדל העמק';
+                  t += `🏢 *סניף ${bn}*\n`;
+                  if(bd.memberships.length) t += `✅ מנויים חדשים (${bd.memberships.length}): ${bd.memberships.map(m=>m.name).join(', ')}\n`;
+                  if(bd.intros.length) t += `📅 אימוני היכרות (${bd.intros.length}): ${bd.intros.map(i=>`${i.name} – ${fmtDate(i.date)} ${i.type||''}`).join(' | ')}\n`;
+                  const answered = bd.newLeads.length + bd.followUp.length;
+                  const noAns = bd.noAnswer.length;
+                  t += `📞 לידים: ${answered} דיברו, ${noAns} לא ענו\n`;
+                  if(bd.cancellations.length) t += `❌ ביטולים (${bd.cancellations.length}): ${bd.cancellations.map(c=>`${c.name}${c.reason?' – '+c.reason:''}`).join(', ')}\n`;
+                  if(bd.freezes.length) t += `⏸ הקפאות (${bd.freezes.length}): ${bd.freezes.map(f=>f.name).join(', ')}\n`;
+                  t += '\n';
+                });
+                if(day.global.tasks.length) {
+                  t += `📌 *משימות לטיפול*\n`;
+                  day.global.tasks.forEach(tk => { t += `• ${tk.name}${tk.desc?' – '+tk.desc:''}\n`; });
+                  t += '\n';
+                }
+                if(day.global.other.length) {
+                  t += `💬 *הערות*\n`;
+                  day.global.other.forEach(o => { t += `• ${o.text}\n`; });
+                }
+                return t;
+              };
+
+              const copyReport = () => {
+                navigator.clipboard.writeText(buildReport()).then(() => {
+                  alert('הדוח הועתק ללוח ✓');
+                });
+              };
+
+              const BranchCard = ({ bk }) => {
+                const bd = day[bk];
+                const bn = bk==='afula' ? 'עפולה' : 'מגדל העמק';
+                const total = bd.newLeads.length + bd.noAnswer.length + bd.followUp.length;
+                const answered = bd.newLeads.length + bd.followUp.length;
+                const convRate = total > 0 ? Math.round((bd.intros.length / total) * 100) : 0;
+
+                return (
+                  <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                    {/* כותרת סניף */}
+                    <div className={`px-6 py-4 ${bk==='afula' ? 'bg-blue-600' : 'bg-violet-600'} text-white`}>
+                      <h3 className="text-xl font-bold">🏢 סניף {bn}</h3>
+                      <p className="text-sm opacity-80">{fmt(currentDate)}</p>
+                    </div>
+
+                    <div className="p-6 space-y-6">
+                      {/* KPI row */}
+                      <div className="grid grid-cols-4 gap-3">
+                        {[
+                          { emoji:'📞', label:'לידים', val: total, sub:'טופלו', color:'blue' },
+                          { emoji:'📅', label:'היכרות', val: bd.intros.length, sub:'נקבעו', color:'green' },
+                          { emoji:'🎉', label:'מנויים', val: bd.memberships.length, sub:'חדשים', color:'emerald' },
+                          { emoji:'❌', label:'ביטולים', val: bd.cancellations.length + bd.freezes.length, sub:'ובקשות', color:'red' },
+                        ].map(({ emoji, label, val, sub, color }) => (
+                          <div key={label} className={`text-center p-3 rounded-xl bg-${color}-50 border border-${color}-100`}>
+                            <div className="text-xl mb-1">{emoji}</div>
+                            <div className={`text-2xl font-black text-${color}-600`}>{val}</div>
+                            <div className="text-xs text-gray-500 font-medium leading-tight">{label}<br/>{sub}</div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* פאנל לידים */}
+                      <div className="bg-gray-50 rounded-xl p-4">
+                        <div className="flex justify-between items-center mb-3">
+                          <span className="font-bold text-gray-700">📋 פירוט לידים</span>
+                          {total > 0 && (
+                            <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-full font-bold">
+                              המרה לאימון: {convRate}%
+                            </span>
+                          )}
+                        </div>
+                        <div className="space-y-2">
+                          {[
+                            { label: 'דיברו (לידים חדשים)', val: bd.newLeads.length, color: 'bg-blue-500', names: bd.newLeads },
+                            { label: 'Follow Up', val: bd.followUp.length, color: 'bg-purple-500', names: bd.followUp },
+                            { label: 'לא ענו', val: bd.noAnswer.length, color: 'bg-orange-400', names: bd.noAnswer },
+                          ].map(({ label, val, color, names }) => (
+                            <div key={label}>
+                              <div className="flex justify-between text-sm mb-1">
+                                <span className="text-gray-600">{label}</span>
+                                <span className="font-bold">{val}</span>
+                              </div>
+                              <div className="w-full bg-gray-200 rounded-full h-2 mb-1">
+                                <div className={`${color} h-2 rounded-full transition-all`}
+                                  style={{width: total > 0 ? `${(val/total)*100}%` : '0%'}} />
+                              </div>
+                              {val > 0 && names && (
+                                <div className="flex flex-wrap gap-1 mt-1">
+                                  {names.map(n => (
+                                    <span key={n.id} className="text-xs bg-white border border-gray-200 text-gray-600 px-2 py-0.5 rounded-full">
+                                      {n.name}{n.status ? ` · ${n.status}` : ''}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* אימוני היכרות */}
+                      {bd.intros.length > 0 && (
+                        <div>
+                          <p className="font-bold text-gray-700 mb-2">📅 אימוני היכרות שנקבעו</p>
+                          <div className="space-y-2">
+                            {bd.intros.map(intro => (
+                              <div key={intro.id} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-4 py-2">
+                                <span className="font-bold text-green-800">{intro.name}</span>
+                                <div className="flex gap-2 text-xs">
+                                  {intro.date && <span className="bg-white border border-green-200 text-green-700 px-2 py-1 rounded-full">{fmtDate(intro.date)}</span>}
+                                  {intro.type && <span className="bg-green-100 text-green-700 px-2 py-1 rounded-full">{intro.type}</span>}
+                                  {intro.trainer && <span className="bg-white border border-green-200 text-green-700 px-2 py-1 rounded-full">👤 {intro.trainer}</span>}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* מנויים חדשים */}
+                      {bd.memberships.length > 0 && (
+                        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+                          <p className="font-bold text-emerald-800 mb-2">🎉 מנויים חדשים!</p>
+                          <div className="flex flex-wrap gap-2">
+                            {bd.memberships.map(m => (
+                              <span key={m.id} className="bg-emerald-600 text-white px-3 py-1 rounded-full text-sm font-bold">
+                                ✓ {m.name}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* ביטולים והקפאות */}
+                      {(bd.cancellations.length > 0 || bd.freezes.length > 0) && (
+                        <div className="space-y-2">
+                          {bd.cancellations.length > 0 && (
+                            <div>
+                              <p className="text-sm font-bold text-red-600 mb-1">❌ ביטולים</p>
+                              {bd.cancellations.map(c => (
+                                <div key={c.id} className="flex justify-between items-center bg-red-50 border border-red-100 rounded-lg px-4 py-2 mb-1">
+                                  <span className="font-medium text-red-800">{c.name}</span>
+                                  {c.reason && <span className="text-xs text-red-500 bg-white border border-red-200 px-2 py-1 rounded-full">{c.reason}</span>}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {bd.freezes.length > 0 && (
+                            <div>
+                              <p className="text-sm font-bold text-yellow-600 mb-1">⏸ הקפאות</p>
+                              {bd.freezes.map(f => (
+                                <div key={f.id} className="flex justify-between items-center bg-yellow-50 border border-yellow-100 rounded-lg px-4 py-2 mb-1">
+                                  <span className="font-medium text-yellow-800">{f.name}</span>
+                                  {f.reason && <span className="text-xs text-yellow-600 bg-white border border-yellow-200 px-2 py-1 rounded-full">{f.reason}</span>}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              };
+
+              return (
+                <div className="space-y-6">
+                  {/* כותרת + כפתורי פעולה */}
+                  <div className="flex flex-wrap justify-between items-center gap-3">
+                    <div>
+                      <h2 className="text-2xl font-black text-gray-800">דוח יומי</h2>
+                      <p className="text-gray-500 text-sm">{fmt(currentDate)}</p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={copyReport}
+                        className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors">
+                        📋 העתק לוואטסאפ
+                      </button>
+                      <button onClick={exportToCSV}
+                        className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors">
+                        ⬇ ייצוא CSV
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* סיכום כולל - שני סניפים */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {[
+                      { emoji:'🎉', label:'מנויים חדשים', val: totalMembers, bg:'bg-emerald-600', desc:'סה"כ שני סניפים' },
+                      { emoji:'📅', label:'אימוני היכרות', val: totalIntros,   bg:'bg-green-500',   desc:'שתואמו היום' },
+                      { emoji:'📞', label:'לידים עפולה',   val: totalLeadsAf,  bg:'bg-blue-600',    desc:'טופלו היום' },
+                      { emoji:'📞', label:'לידים מגדל',    val: totalLeadsMg,  bg:'bg-violet-600',  desc:'טופלו היום' },
+                    ].map(({ emoji, label, val, bg, desc }) => (
+                      <div key={label} className={`${bg} text-white rounded-2xl p-4 text-center shadow-md`}>
+                        <div className="text-2xl mb-1">{emoji}</div>
+                        <div className="text-4xl font-black">{val}</div>
+                        <div className="text-sm font-bold mt-1 opacity-90">{label}</div>
+                        <div className="text-xs opacity-70">{desc}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* כרטיסי סניפים */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <BranchCard bk="afula" />
+                    <BranchCard bk="migdalHaemek" />
+                  </div>
+
+                  {/* משימות + הערות */}
+                  {(day.global.tasks.length > 0 || day.global.other.length > 0) && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {day.global.tasks.length > 0 && (
+                        <div className="bg-blue-900 text-white rounded-2xl p-5">
+                          <p className="font-bold text-lg mb-3">📌 משימות לטיפול</p>
+                          <div className="space-y-2">
+                            {day.global.tasks.map(task => (
+                              <div key={task.id} className="bg-blue-800 rounded-lg px-4 py-3">
+                                <p className="font-bold">{task.name}</p>
+                                {task.desc && <p className="text-blue-200 text-sm mt-0.5">{task.desc}</p>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {day.global.other.length > 0 && (
+                        <div className="bg-slate-800 text-white rounded-2xl p-5">
+                          <p className="font-bold text-lg mb-3">💬 הערות ובקשות</p>
+                          <div className="space-y-2">
+                            {day.global.other.map(item => (
+                              <div key={item.id} className="bg-slate-700 rounded-lg px-4 py-3">
+                                <p className="text-slate-200 text-sm">{item.text}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* אזהרת ביטולים אם יש */}
+                  {totalCancel + totalFreeze > 0 && (
+                    <div className="bg-red-50 border border-red-200 rounded-2xl p-5">
+                      <p className="font-bold text-red-700 text-lg mb-3">⚠️ דורש טיפול שימור ({totalCancel + totalFreeze})</p>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {totalCancel > 0 && (
+                          <div>
+                            <p className="text-sm font-bold text-red-600 mb-2">ביטולים</p>
+                            {['afula','migdalHaemek'].flatMap(bk =>
+                              day[bk].cancellations.map(c => (
+                                <div key={c.id} className="flex justify-between items-center bg-white border border-red-100 rounded-lg px-3 py-2 mb-1">
+                                  <div>
+                                    <span className="font-bold text-red-800 text-sm">{c.name}</span>
+                                    <span className="text-xs text-gray-400 mr-2">({bk==='afula'?'עפולה':'מגדל'})</span>
+                                  </div>
+                                  {c.reason && <span className="text-xs text-red-500">{c.reason}</span>}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                        {totalFreeze > 0 && (
+                          <div>
+                            <p className="text-sm font-bold text-yellow-600 mb-2">הקפאות</p>
+                            {['afula','migdalHaemek'].flatMap(bk =>
+                              day[bk].freezes.map(f => (
+                                <div key={f.id} className="flex justify-between items-center bg-white border border-yellow-100 rounded-lg px-3 py-2 mb-1">
+                                  <div>
+                                    <span className="font-bold text-yellow-800 text-sm">{f.name}</span>
+                                    <span className="text-xs text-gray-400 mr-2">({bk==='afula'?'עפולה':'מגדל'})</span>
+                                  </div>
+                                  {f.reason && <span className="text-xs text-yellow-600">{f.reason}</span>}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </main>
+        </div>
+      );
+    }
+
+    // --- קודי גישה (מספרי הטלפון המורשים) ---
+    const ACCESS_CODES = [
+      '0544742910',  // יסמין / גיא - בעלי הסטודיו
+      '',            // ← הכנסי כאן את מספר הטלפון של המזכירה
+    ];
+    const SESSION_KEY = 'boost_crm_auth';
+
+    function LoginScreen({ onLogin }) {
+      const [code, setCode]   = useState('');
+      const [error, setError] = useState('');
+      const [shake, setShake] = useState(false);
+
+      const login = (e) => {
+        e.preventDefault();
+        if (ACCESS_CODES.includes(code.trim()) && code.trim() !== '') {
+          sessionStorage.setItem(SESSION_KEY, '1');
+          onLogin();
+        } else {
+          setError('מספר שגוי, נסי שוב');
+          setShake(true);
+          setCode('');
+          setTimeout(() => setShake(false), 600);
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 flex items-center justify-center p-4">
+          <style>{`
+            @keyframes shake {
+              0%,100%{transform:translateX(0)}
+              20%,60%{transform:translateX(-8px)}
+              40%,80%{transform:translateX(8px)}
+            }
+            .shake { animation: shake 0.5s ease; }
+          `}</style>
+          <div className="w-full max-w-sm">
+            <div className="text-center mb-8">
+              <h1 className="text-4xl font-black text-white mb-1">
+                <span className="text-blue-400">Boost</span> CRM
+              </h1>
+              <p className="text-slate-400 text-sm">סטודיו גיא ויסמין</p>
+            </div>
+
+            <div className={`bg-white rounded-2xl shadow-2xl p-8 ${shake ? 'shake' : ''}`}>
+              <h2 className="text-xl font-bold text-gray-800 mb-2 text-center">כניסה למערכת</h2>
+              <p className="text-gray-400 text-sm text-center mb-6">הכנסי את מספר הטלפון שלך</p>
+
+              <form onSubmit={login} className="space-y-4">
+                <input
+                  type="tel"
+                  placeholder="05XXXXXXXX"
+                  value={code}
+                  onChange={e => { setCode(e.target.value); setError(''); }}
+                  className="w-full border-2 border-gray-200 rounded-xl px-4 py-3 text-center text-lg tracking-widest font-bold focus:outline-none focus:border-blue-500 transition-colors"
+                  autoFocus
+                  inputMode="numeric"
+                />
+
+                {error && (
+                  <div className="bg-red-50 border border-red-200 text-red-600 text-sm rounded-xl px-4 py-3 text-center font-medium">
+                    ⚠️ {error}
+                  </div>
+                )}
+
+                <button type="submit"
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl transition-colors text-sm">
+                  כניסה →
+                </button>
+              </form>
+            </div>
+
+            <p className="text-center text-slate-500 text-xs mt-6">
+              🔒 גישה מורשית בלבד
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    // --- Root עם בדיקת גישה ---
+    function Root() {
+      const [loggedIn, setLoggedIn] = useState(
+        sessionStorage.getItem(SESSION_KEY) === '1'
+      );
+
+      if (!loggedIn) return <LoginScreen onLogin={() => setLoggedIn(true)} />;
+      return <App onLogout={() => { sessionStorage.removeItem(SESSION_KEY); setLoggedIn(false); }} />;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+  </script>
+</body>
+</html>
