@@ -9,6 +9,7 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <!-- Firebase -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
@@ -104,7 +105,13 @@
         if (unsubRef.current) unsubRef.current();
         const unsub = window.db.collection('reports').doc(currentDate)
           .onSnapshot(snap => {
-            const cloudData = snap.exists ? snap.data() : emptyDay();
+            const raw = snap.exists ? snap.data() : {};
+            const base = emptyDay();
+            const cloudData = {
+              afula:       { ...base.afula,       ...(raw.afula       || {}) },
+              migdalHaemek:{ ...base.migdalHaemek,...(raw.migdalHaemek|| {}) },
+              global:      { ...base.global,      ...(raw.global      || {}) },
+            };
             fromCloud.current = true;
             setDayData(prev => {
               // שמר גרסה מקומית לכל חלק שנערך מקומית, עדכן את השאר מהענן
@@ -317,6 +324,10 @@
                 className={`flex-1 py-2.5 text-sm font-bold rounded-lg transition-all ${activeTab==='summary'?'bg-white text-blue-700 shadow':'text-gray-600'}`}>
                 📊 סיכום יומי
               </button>
+              <button onClick={()=>setActiveTab('retention')}
+                className={`flex-1 py-2.5 text-sm font-bold rounded-lg transition-all ${activeTab==='retention'?'bg-slate-800 text-lime-400 shadow':'text-gray-600'}`}>
+                💪 שימור מתאמנות
+              </button>
             </div>
 
             {activeTab === 'data' && (
@@ -526,6 +537,9 @@
                 </div>
               </div>
             )}
+
+            {/* שימור מתאמנות */}
+            {activeTab === 'retention' && <TraineeRetention />}
 
             {/* סיכום */}
             {activeTab === 'summary' && (() => {
@@ -828,6 +842,660 @@
               );
             })()}
           </main>
+        </div>
+      );
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════
+    // קומפוננט שימור מתאמנות — סנכרון Firestore
+    // ════════════════════════════════════════════════════════════════════
+
+    const RETENTION_AVATAR_COLORS = [
+      { bg:'rgba(200,240,101,0.18)', color:'#a8e040' },
+      { bg:'rgba(95,212,184,0.18)',  color:'#5fd4b8' },
+      { bg:'rgba(107,181,255,0.18)', color:'#6bb5ff' },
+      { bg:'rgba(180,127,255,0.18)', color:'#b47fff' },
+      { bg:'rgba(255,179,71,0.18)',  color:'#ffb347' },
+      { bg:'rgba(255,107,107,0.18)', color:'#ff6b6b' },
+    ];
+
+    const CAT = {
+      none:    { label:'ללא סטטוס',   emoji:'⬜', border:'rgba(255,255,255,0.1)',  bg:'#1a1a22',               text:'#aaa' },
+      expired: { label:'מנוי נגמר',   emoji:'🔴', border:'rgba(255,107,107,0.5)', bg:'rgba(255,107,107,0.08)',text:'#ff6b6b' },
+      booked:  { label:'תיאמה אימון', emoji:'🟢', border:'rgba(74,222,128,0.5)',  bg:'rgba(74,222,128,0.08)', text:'#4ade80' },
+      frozen:  { label:'הקפאה',       emoji:'🟣', border:'rgba(180,127,255,0.5)', bg:'rgba(180,127,255,0.08)',text:'#b47fff' },
+      noanswer:{ label:'לא עונה',     emoji:'🟡', border:'rgba(255,179,71,0.5)',  bg:'rgba(255,179,71,0.08)', text:'#ffb347' },
+    };
+
+    const DEFAULT_TEMPLATES = {
+      default:  'היי {שם} 💪\nחסרת לנו בסטודיו!\nמתי אנחנו רואים אותך חוזרת לאימון?\nאנחנו כאן בשבילך 🤍',
+      medical:  'היי {שם} 🌸\nשמענו שעברת תקופה לא פשוטה.\nרפואה שלמה! כשתרגישי מוכנה – אנחנו כאן ומחכות לך 🤍',
+      army:     'היי {שם} 🙏\nתודה רבה על שירותך!\nכשתחזרי – המקום שלך שמור בסטודיו.\nנשמרי 🤍',
+      grief:    'היי {שם},\nשולחות לך חיבוק חם בתקופה הזו.\nאנחנו כאן בשבילך כשתרגישי מוכנה 🤍',
+      payment:  'היי {שם} 😊\nרצינו להזכיר לך שיש תשלום פתוח.\nנשמח לסדר את זה יחד כדי שתוכלי לחזור לאימונים!\nמחכות לך 🤍',
+      noanswer: 'היי {שם} 👋\nניסינו ליצור איתך קשר.\nאנחנו כאן בכל שאלה – מחכות לשמוע ממך 🤍',
+    };
+    const TEMPLATE_LABELS = {
+      default:'תבנית רגילה', medical:'רפואי', army:'צבא/מילואים',
+      grief:'אבל', payment:'תשלום', noanswer:'לא עונה (ניסיון שני)',
+    };
+
+    function pickTemplate(note, tpls) {
+      if (!note) return tpls.default;
+      const n = note.toLowerCase();
+      if (n.includes('רפוא')||n.includes('ניתוח')||n.includes('פציעה')) return tpls.medical;
+      if (n.includes('צבא')||n.includes('מילואים')||n.includes('שירות')) return tpls.army;
+      if (n.includes('אבל')||n.includes('שכול')) return tpls.grief;
+      if (n.includes('לשלם')||n.includes('חוב')||n.includes('תשלום')) return tpls.payment;
+      if (n.includes('לא עונ')||n.includes('אין מענה')) return tpls.noanswer;
+      return tpls.default;
+    }
+    function buildRetentionMsg(name, note, tpls) {
+      return pickTemplate(note, tpls).replace(/{שם}/g, name.split(' ')[0]);
+    }
+    function getNoteBadge(note) {
+      if (!note) return null;
+      const n = note.toLowerCase();
+      if (n.includes('רפוא')||n.includes('ניתוח')||n.includes('פציעה')) return { label:'רפואי', c:'#5fd4b8' };
+      if (n.includes('צבא')||n.includes('מילואים'))                     return { label:'צבא/מילואים', c:'#6bb5ff' };
+      if (n.includes('אבל'))                                             return { label:'אבל', c:'#b47fff' };
+      if (n.includes('לשלם')||n.includes('חוב')||n.includes('תשלום'))   return { label:'תשלום', c:'#ffb347' };
+      if (n.includes('לא עונ')||n.includes('אין מענה'))                  return { label:'לא עונה', c:'#aaa' };
+      return { label:'הערה', c:'#a8e040' };
+    }
+
+    // ── Firestore helpers ─────────────────────────────────────────────
+    const LS_SUNDAY  = 'retention_sunday_shown';
+    const MAX_WEEKS  = 13;
+    const FS_COL     = 'retention_reports';
+    const FS_META    = 'retention_meta';
+
+    async function fsLoadHistory() {
+      try {
+        const snap = await window.db.collection(FS_COL).orderBy('date','desc').limit(MAX_WEEKS).get();
+        return snap.docs.map(d => d.data());
+      } catch(e) { console.error('fsLoadHistory',e); return []; }
+    }
+    async function fsSaveReport(report) {
+      try { await window.db.collection(FS_COL).doc(String(report.id)).set(report); } catch(e) { console.error('fsSaveReport',e); }
+    }
+    async function fsUpdateReport(reportId, members) {
+      try { await window.db.collection(FS_COL).doc(String(reportId)).update({ members }); } catch(e) { console.error('fsUpdateReport',e); }
+    }
+    async function fsSetCurrentReport(reportId) {
+      try { await window.db.doc(`${FS_META}/current`).set({ currentReportId: String(reportId) }); } catch(e) { console.error('fsSetCurrent',e); }
+    }
+    async function fsGetCurrentReport() {
+      try {
+        const meta = await window.db.doc(`${FS_META}/current`).get();
+        if (!meta.exists) return null;
+        const { currentReportId } = meta.data();
+        if (!currentReportId) return null;
+        const rep = await window.db.collection(FS_COL).doc(String(currentReportId)).get();
+        return rep.exists ? rep.data() : null;
+      } catch(e) { console.error('fsGetCurrent',e); return null; }
+    }
+
+    function TraineeRetention() {
+      const [step, setStep]               = useState('loading'); // 'loading'|'upload'|'map'|'list'|'history'
+      const [rawRows, setRawRows]         = useState([]);
+      const [headers, setHeaders]         = useState([]);
+      const [colMap, setColMap]           = useState({ name:'', note:'', phone:'', memberId:'' });
+      const [members, setMembers]         = useState([]);
+      const [mState, setMState]           = useState({});
+      const [currentReportId, setCurrentReportId] = useState(null);
+      const [history, setHistory]         = useState([]);
+      const [historyView, setHistoryView] = useState(null);
+      const [filter, setFilter]           = useState('all');
+      const [catFilter, setCatFilter]     = useState('all');
+      const [search, setSearch]           = useState('');
+      const [fileName, setFileName]       = useState('');
+      const [templates, setTemplates]     = useState(DEFAULT_TEMPLATES);
+      const [showTpl, setShowTpl]         = useState(false);
+      const [dragging, setDragging]       = useState(false);
+      const [toast, setToast]             = useState('');
+      const [syncStatus, setSyncStatus]   = useState('saved'); // 'saved'|'saving'|'error'
+      const [sundayPopup, setSundayPopup] = useState(false);
+      const fileRef    = useRef(null);
+      const saveTimer  = useRef(null);
+
+      // ── האזנה ל-Firestore בזמן אמת ──────────────────────────────────
+      const loadedReportIdRef = useRef(null);
+
+      useEffect(() => {
+        const today = new Date().toISOString().split('T')[0];
+        if (new Date().getDay() === 0 && localStorage.getItem(LS_SUNDAY) !== today) {
+          setSundayPopup(true);
+          localStorage.setItem(LS_SUNDAY, today);
+        }
+
+        // טעינת היסטוריה
+        fsLoadHistory().then(hist => setHistory(hist));
+
+        // האזן ל-retention_meta/current — מתעדכן בכל מכשיר בזמן אמת
+        const unsubscribe = window.db.doc(`${FS_META}/current`).onSnapshot(async (snap) => {
+          if (!snap.exists || !snap.data().currentReportId) {
+            setStep('upload');
+            return;
+          }
+          const remoteId = snap.data().currentReportId;
+
+          // אם הדוח כבר טעון במכשיר הזה — אל תטען מחדש (מניעת איפוס בזמן עריכה)
+          if (String(remoteId) === String(loadedReportIdRef.current)) return;
+
+          try {
+            const rep = await window.db.collection(FS_COL).doc(String(remoteId)).get();
+            if (!rep.exists) { setStep('upload'); return; }
+            const current = rep.data();
+            const restoredMembers = (current.members || []).map(m => ({ ...m }));
+            const restoredState   = {};
+            restoredMembers.forEach(m => {
+              restoredState[m.id] = { done: m.done||false, noAnswer: m.noAnswer||false, category: m.category||'none', msg: m.msg||'' };
+            });
+            loadedReportIdRef.current = remoteId;
+            setMembers(restoredMembers);
+            setMState(restoredState);
+            setCurrentReportId(current.id);
+            setFileName(current.fileName||'');
+            setStep('list');
+          } catch(e) {
+            console.error('onSnapshot load error', e);
+            setStep('upload');
+          }
+        }, (err) => {
+          console.error('onSnapshot error', err);
+          setStep('upload');
+        });
+
+        return () => unsubscribe();
+      }, []);
+
+      // ── auto-save ל-Firestore כשמשתנה mState ─────────────────────────
+      useEffect(() => {
+        if (!currentReportId || members.length === 0) return;
+        if (saveTimer.current) clearTimeout(saveTimer.current);
+        setSyncStatus('saving');
+        saveTimer.current = setTimeout(async () => {
+          const updatedMembers = members.map(m => ({ ...m, ...(mState[m.id]||{}) }));
+          await fsUpdateReport(currentReportId, updatedMembers);
+          // עדכן גם ב-history המקומי
+          setHistory(prev => prev.map(r => r.id === currentReportId ? { ...r, members: updatedMembers } : r));
+          setSyncStatus('saved');
+        }, 1200);
+      }, [mState]);
+
+      const showToast = (msg) => { setToast(msg); setTimeout(()=>setToast(''), 2400); };
+
+      // ── קריאת קובץ ──────────────────────────────────────────────────
+      const processFile = (file) => {
+        setFileName(file.name);
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const wb   = XLSX.read(e.target.result, { type:'array' });
+            const ws   = wb.Sheets[wb.SheetNames[0]];
+            const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' });
+            if (rows.length < 2) { alert('הקובץ ריק או לא תקין'); return; }
+            const hdrs = rows[0].map((h,i) => ({ label:String(h||`עמודה ${i+1}`), index:i }));
+            setRawRows(rows); setHeaders(hdrs);
+            const auto = { name:'', note:'', phone:'', memberId:'' };
+            hdrs.forEach(h => {
+              const l = h.label.toLowerCase();
+              if (!auto.name     && (l.includes('שם')||l.includes('name')||l.includes('לקוח'))) auto.name = String(h.index);
+              if (!auto.note     && (l.includes('הערה')||l.includes('note')||l.includes('סיבה')||l.includes('סטטוס'))) auto.note = String(h.index);
+              if (!auto.phone    && (l.includes('טלפון')||l.includes('phone')||l.includes('נייד'))) auto.phone = String(h.index);
+              if (!auto.memberId && (l.includes('מס')||l.includes('id')||l.includes('קוד'))) auto.memberId = String(h.index);
+            });
+            setColMap(auto); setStep('map');
+          } catch(err) { alert('שגיאה: ' + err.message); }
+        };
+        reader.readAsArrayBuffer(file);
+      };
+
+      const applyMapping = async () => {
+        if (colMap.name === '') { alert('חובה לבחור עמודת שם'); return; }
+
+        // שמות מכל הדוחות ב-3 חודשים אחרונים
+        const cutoff   = Date.now() - 90*24*60*60*1000;
+        const prevNames = new Set();
+        history.forEach(r => {
+          if (new Date(r.date).getTime() >= cutoff)
+            r.members.forEach(m => prevNames.add(m.name));
+        });
+
+        const reportId   = Date.now();
+        const newMembers = []; const newState = {};
+        rawRows.slice(1).forEach((row, i) => {
+          const name = String(row[colMap.name]||'').trim();
+          if (!name) return;
+          const id    = colMap.memberId !== '' ? String(row[colMap.memberId]||i) : String(i);
+          const note  = colMap.note  !== '' ? String(row[colMap.note] ||'').trim() : '';
+          const phone = colMap.phone !== '' ? String(row[colMap.phone]||'').trim() : '';
+          const msg   = buildRetentionMsg(name, note, templates);
+          newMembers.push({ id, name, note, phone, recurring: prevNames.has(name), done:false, noAnswer:false, category:'none', msg });
+          newState[id] = { done:false, noAnswer:false, category:'none', msg };
+        });
+
+        const newReport = {
+          id: reportId,
+          date: new Date().toISOString(),
+          dateLabel: new Date().toLocaleDateString('he-IL'),
+          fileName,
+          members: newMembers,
+        };
+
+        setSyncStatus('saving');
+        await Promise.all([
+          fsSaveReport(newReport),
+          fsSetCurrentReport(reportId),
+        ]);
+        setSyncStatus('saved');
+
+        setHistory(prev => [newReport, ...prev].slice(0, MAX_WEEKS));
+        setMembers(newMembers);
+        setMState(newState);
+        loadedReportIdRef.current = reportId;
+        setCurrentReportId(reportId);
+        setStep('list');
+      };
+
+      const setCategory  = (id, cat) => setMState(p => ({ ...p, [id]: { ...p[id], category:cat } }));
+      const markDone     = (id) => setMState(p => { const c=p[id]; const nd=!c.done; return { ...p, [id]:{ ...c, done:nd, noAnswer:nd?c.noAnswer:false } }; });
+      const markNoAnswer = (id) => setMState(p => ({ ...p, [id]:{ ...p[id], done:true, noAnswer:true, category:'noanswer' } }));
+      const updateMsg    = (id, val) => setMState(p => ({ ...p, [id]:{ ...p[id], msg:val } }));
+      const regenMsg     = (id, name, note) => setMState(p => ({ ...p, [id]:{ ...p[id], msg:buildRetentionMsg(name,note,templates) } }));
+
+      const copyMsg = (id) => {
+        const msg = mState[id]?.msg || '';
+        navigator.clipboard.writeText(msg).catch(() => {
+          const el = document.createElement('textarea'); el.value=msg;
+          document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el);
+        });
+        showToast('✓ הועתק ללוח');
+      };
+      const openWA = (id, phone) => {
+        copyMsg(id);
+        window.open(`https://wa.me/972${phone.replace(/\D/g,'').replace(/^0/,'')}`, '_blank');
+      };
+      const exportSummary = () => {
+        const rows = [['שם','הערה','טלפון','סטטוס','קטגוריה','מופיעה שוב?']];
+        members.forEach(m => {
+          const s = mState[m.id];
+          rows.push([m.name, m.note, m.phone,
+            s?.noAnswer?'אין מענה':s?.done?'טופל':'ממתין',
+            CAT[s?.category||'none']?.label||'',
+            m.recurring?'כן':'לא'
+          ]);
+        });
+        const ws2 = XLSX.utils.aoa_to_sheet(rows);
+        const wb2 = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb2, ws2, 'סיכום שבועי');
+        XLSX.writeFile(wb2, `סיכום-שימור-${new Date().toLocaleDateString('he-IL').replace(/\//g,'-')}.xlsx`);
+        showToast('📥 קובץ יוצא בהצלחה');
+      };
+
+      const total    = members.length;
+      const done     = Object.values(mState).filter(s=>s.done).length;
+      const pct      = total > 0 ? Math.round((done/total)*100) : 0;
+      const filtered = members.filter(m => {
+        if (search && !m.name.toLowerCase().includes(search.toLowerCase())) return false;
+        const s = mState[m.id];
+        if (filter==='pending' && s?.done)  return false;
+        if (filter==='done' && !s?.done)    return false;
+        if (catFilter !== 'all' && (s?.category||'none') !== catFilter) return false;
+        return true;
+      });
+
+      const S = { bg:'#0f0f13', surface:'#1a1a22', surface2:'#22222d', accent:'#c8f065', muted:'#888', text:'#f0f0f0', border:'rgba(255,255,255,0.08)' };
+
+      // ── כרטיס מתאמנת ────────────────────────────────────────────────
+      const renderCard = (m, i, stateObj, handlers, readOnly) => {
+        const s   = stateObj || { category:'none' };
+        const cat = CAT[s.category||'none'];
+        const ac  = RETENTION_AVATAR_COLORS[i % RETENTION_AVATAR_COLORS.length];
+        const badge = getNoteBadge(m.note);
+        const initials = m.name.split(' ').filter(Boolean).slice(0,2).map(w=>w[0]).join('');
+        return (
+          <div key={m.id||i} style={{ background:cat.bg, border:`1px solid ${cat.border}`, borderRadius:12, padding:'14px 18px', marginBottom:10, opacity:s.done?0.5:1, transition:'all 0.2s' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:11 }}>
+              <div style={{ background:ac.bg, color:ac.color, width:36, height:36, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontSize:12, fontWeight:700, flexShrink:0 }}>{initials}</div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:600, fontSize:14, display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
+                  {m.recurring && <span title="הופיעה בדוח קודם (3 חודשים אחרונים)">🔴</span>}
+                  {m.name}
+                  {badge && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:99, fontWeight:600, background:'rgba(255,255,255,0.08)', color:badge.c }}>{badge.label}</span>}
+                </div>
+                {m.note && <div style={{ fontSize:11, color:S.muted, marginTop:2 }}>{m.note}</div>}
+              </div>
+              {!readOnly ? (
+                <select value={s.category||'none'} onChange={e=>handlers.setCategory(m.id, e.target.value)}
+                  style={{ background:S.surface2, border:`1px solid ${cat.border}`, color:cat.text, fontSize:11, padding:'5px 8px', borderRadius:7, cursor:'pointer', fontFamily:'Heebo, sans-serif' }}>
+                  {Object.entries(CAT).map(([k,v])=><option key={k} value={k}>{v.emoji} {v.label}</option>)}
+                </select>
+              ) : (
+                s.category && s.category!=='none' &&
+                <span style={{ fontSize:11, padding:'3px 9px', borderRadius:99, background:cat.bg, color:cat.text, border:`1px solid ${cat.border}` }}>{CAT[s.category].emoji} {CAT[s.category].label}</span>
+              )}
+              {s.noAnswer && <div style={{ fontSize:11, color:'#ffb347', whiteSpace:'nowrap' }}>📵 אין מענה</div>}
+              {s.done && !s.noAnswer && <div style={{ fontSize:11, color:'#4ade80', whiteSpace:'nowrap' }}>✓ טופל</div>}
+            </div>
+            {!readOnly ? (
+              <>
+                <textarea rows={4} value={s.msg||''} onChange={e=>handlers.updateMsg(m.id, e.target.value)}
+                  style={{ width:'100%', background:S.surface2, border:'1px solid rgba(255,255,255,0.07)', color:S.text, padding:'9px 12px', borderRadius:8, fontSize:12, resize:'vertical', lineHeight:1.7, direction:'rtl', marginBottom:10, fontFamily:'Heebo, sans-serif' }} />
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                  {[
+                    { lbl:'📋 העתק', fn:()=>handlers.copyMsg(m.id), bg:'rgba(200,240,101,0.1)', c:'#c8f065', bd:'rgba(200,240,101,0.25)' },
+                    ...(m.phone?[{ lbl:'📱 WhatsApp', fn:()=>handlers.openWA(m.id,m.phone), bg:'rgba(95,212,184,0.1)', c:'#5fd4b8', bd:'rgba(95,212,184,0.25)' }]:[]),
+                    { lbl:s.done?'בטל טיפול':'✓ טופל', fn:()=>handlers.markDone(m.id), bg:'rgba(74,222,128,0.1)', c:'#4ade80', bd:'rgba(74,222,128,0.25)' },
+                    { lbl:'📵 אין מענה', fn:()=>handlers.markNoAnswer(m.id), bg:'rgba(255,179,71,0.1)', c:'#ffb347', bd:'rgba(255,179,71,0.2)' },
+                    { lbl:'↺ חדש הודעה', fn:()=>handlers.regenMsg(m.id,m.name,m.note), bg:'transparent', c:S.muted, bd:'rgba(255,255,255,0.1)' },
+                  ].map(({lbl,fn,bg,c,bd})=>(
+                    <button key={lbl} onClick={fn} style={{ background:bg, color:c, border:`1px solid ${bd}`, padding:'6px 11px', borderRadius:7, fontSize:11, fontWeight:500, cursor:'pointer', fontFamily:'Heebo, sans-serif' }}>{lbl}</button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize:12, color:S.muted, padding:'8px 10px', background:S.surface2, borderRadius:8, lineHeight:1.6, whiteSpace:'pre-wrap', direction:'rtl' }}>
+                {s.msg || '—'}
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      const handlers = { setCategory, markDone, markNoAnswer, updateMsg, regenMsg, copyMsg, openWA };
+
+      // ── תצוגת דוח מהיסטוריה ──────────────────────────────────────────
+      const HistoryReportView = ({ report, onBack }) => {
+        const [hSearch, setHSearch] = useState('');
+        const [hCat, setHCat]       = useState('all');
+        const ms = report.members.filter(m => {
+          if (hSearch && !m.name.toLowerCase().includes(hSearch.toLowerCase())) return false;
+          if (hCat !== 'all' && (m.category||'none') !== hCat) return false;
+          return true;
+        });
+        const catCounts = {};
+        report.members.forEach(m => { const c=m.category||'none'; catCounts[c]=(catCounts[c]||0)+1; });
+        return (
+          <div>
+            <button onClick={onBack} style={{ background:'none', border:'none', color:S.accent, fontSize:13, cursor:'pointer', marginBottom:14, display:'flex', alignItems:'center', gap:6 }}>← חזרה להיסטוריה</button>
+            <div style={{ background:S.surface, borderRadius:12, padding:'14px 18px', marginBottom:14 }}>
+              <div style={{ fontWeight:700, fontSize:15, color:S.accent, marginBottom:3 }}>📋 {report.dateLabel}</div>
+              <div style={{ color:S.muted, fontSize:12 }}>{report.fileName} · {report.members.length} מתאמנות</div>
+              <div style={{ display:'flex', gap:10, marginTop:8, flexWrap:'wrap' }}>
+                {Object.entries(CAT).filter(([k])=>catCounts[k]&&k!=='none').map(([k,v])=>(
+                  <div key={k} style={{ fontSize:11, color:v.text }}>{v.emoji} {v.label}: {catCounts[k]}</div>
+                ))}
+                <div style={{ fontSize:11, color:'#4ade80' }}>✓ {report.members.filter(m=>m.done).length} טופלו</div>
+                <div style={{ fontSize:11, color:'#ffb347' }}>📵 {report.members.filter(m=>m.noAnswer).length} אין מענה</div>
+              </div>
+            </div>
+            <div style={{ display:'flex', gap:8, marginBottom:12, flexWrap:'wrap' }}>
+              <input type="text" placeholder="🔍 חיפוש..." value={hSearch} onChange={e=>setHSearch(e.target.value)}
+                style={{ flex:1, minWidth:130, background:S.surface, border:'1px solid rgba(255,255,255,0.13)', color:S.text, padding:'7px 10px', borderRadius:8, fontSize:12, direction:'rtl' }} />
+              <button onClick={()=>setHCat('all')} style={{ padding:'5px 11px', borderRadius:8, fontSize:11, cursor:'pointer', border:`1px solid ${hCat==='all'?S.accent:'rgba(255,255,255,0.13)'}`, background:hCat==='all'?'rgba(200,240,101,0.15)':'transparent', color:hCat==='all'?S.accent:'#aaa' }}>הכל</button>
+              {Object.entries(CAT).filter(([k])=>k!=='none'&&catCounts[k]).map(([k,v])=>(
+                <button key={k} onClick={()=>setHCat(hCat===k?'all':k)} style={{ padding:'5px 11px', borderRadius:8, fontSize:11, cursor:'pointer', border:`1px solid ${hCat===k?v.text:'rgba(255,255,255,0.12)'}`, background:hCat===k?v.bg:'transparent', color:hCat===k?v.text:'#aaa' }}>{v.emoji} {v.label}</button>
+              ))}
+            </div>
+            {ms.map((m,i) => renderCard(m, i, m, null, true))}
+          </div>
+        );
+      };
+
+      // ── רשימת היסטוריה ───────────────────────────────────────────────
+      const HistoryListView = ({ onBack }) => (
+        <div>
+          <button onClick={onBack} style={{ background:'none', border:'none', color:S.accent, fontSize:13, cursor:'pointer', marginBottom:14, display:'flex', alignItems:'center', gap:6 }}>← חזרה</button>
+          <div style={{ fontSize:16, fontWeight:700, marginBottom:14, color:S.accent }}>📚 היסטוריית דוחות</div>
+          {history.length === 0 ? (
+            <div style={{ textAlign:'center', padding:'40px 0', color:S.muted }}>
+              <div style={{ fontSize:32, marginBottom:8 }}>📭</div>
+              <div>עדיין אין דוחות שמורים</div>
+            </div>
+          ) : history.map((r, i) => {
+            const catCounts = {};
+            r.members.forEach(m => { const c=m.category||'none'; if(c!=='none') catCounts[c]=(catCounts[c]||0)+1; });
+            const doneCount = r.members.filter(m=>m.done).length;
+            const recCount  = r.members.filter(m=>m.recurring).length;
+            return (
+              <div key={r.id} onClick={()=>setHistoryView(r)}
+                style={{ background:S.surface, border:`1px solid ${i===0?'rgba(200,240,101,0.4)':S.border}`, borderRadius:12, padding:'14px 18px', marginBottom:10, cursor:'pointer' }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:7 }}>
+                  <div>
+                    <div style={{ fontWeight:700, fontSize:13, color:i===0?S.accent:S.text }}>
+                      {i===0&&'⭐ '}📋 {r.dateLabel}
+                      {i===0&&<span style={{ fontSize:11, color:S.muted, marginRight:8 }}>הדוח האחרון</span>}
+                    </div>
+                    <div style={{ fontSize:11, color:S.muted, marginTop:2 }}>{r.fileName}</div>
+                  </div>
+                  <div style={{ fontSize:12, color:S.muted }}>{r.members.length} מתאמנות</div>
+                </div>
+                <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+                  {Object.entries(catCounts).map(([k,v])=>(
+                    <span key={k} style={{ fontSize:10, padding:'2px 8px', borderRadius:99, background:CAT[k]?.bg, color:CAT[k]?.text, border:`1px solid ${CAT[k]?.border}` }}>{CAT[k]?.emoji} {v}</span>
+                  ))}
+                  {doneCount>0 && <span style={{ fontSize:10, padding:'2px 8px', borderRadius:99, background:'rgba(74,222,128,0.1)', color:'#4ade80', border:'1px solid rgba(74,222,128,0.25)' }}>✓ {doneCount}</span>}
+                  {recCount>0  && <span style={{ fontSize:10, padding:'2px 8px', borderRadius:99, background:'rgba(255,68,68,0.1)',  color:'#ff6b6b', border:'1px solid rgba(255,68,68,0.25)' }}>🔴 {recCount} חוזרות</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+
+      // ── sync indicator ────────────────────────────────────────────────
+      const SyncDot = () => {
+        if (syncStatus==='saving') return <div style={{ display:'flex', alignItems:'center', gap:5, fontSize:11, color:'#ffb347' }}><span style={{ width:7, height:7, borderRadius:'50%', background:'#ffb347', display:'inline-block', animation:'pulse 1s infinite' }} />שומר...</div>;
+        if (syncStatus==='error')  return <div style={{ fontSize:11, color:'#ff6b6b' }}>⚠ שגיאת שמירה</div>;
+        return <div style={{ display:'flex', alignItems:'center', gap:5, fontSize:11, color:'#4ade80' }}><span style={{ width:7, height:7, borderRadius:'50%', background:'#4ade80', display:'inline-block' }} />מסונכרן</div>;
+      };
+
+      // ════════════════════════════════════════════════════════════════
+      return (
+        <div style={{ background:S.bg, color:S.text, minHeight:'60vh', borderRadius:16, overflow:'hidden' }}>
+          <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+
+          {/* פופאפ יום ראשון */}
+          {sundayPopup && (
+            <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:16 }}>
+              <div style={{ background:'#1a1a22', border:'2px solid #c8f065', borderRadius:20, padding:'32px 36px', maxWidth:360, textAlign:'center', width:'100%' }}>
+                <div style={{ fontSize:46, marginBottom:10 }}>📋</div>
+                <div style={{ fontSize:19, fontWeight:700, color:'#c8f065', marginBottom:8 }}>יום ראשון – זמן לדוח שבועי!</div>
+                <div style={{ color:'#aaa', fontSize:13, lineHeight:1.6, marginBottom:22 }}>אל תשכחי להוריד את דוח ההיעדרויות מבוסטאפ ולהעלות אותו כאן 💪</div>
+                <button onClick={()=>setSundayPopup(false)} style={{ background:'#c8f065', color:'#0f0f13', padding:'11px 0', borderRadius:10, fontSize:14, fontWeight:700, border:'none', cursor:'pointer', width:'100%' }}>הבנתי ✓</button>
+                <button onClick={()=>setSundayPopup(false)} style={{ background:'none', color:'#555', border:'none', cursor:'pointer', fontSize:12, marginTop:10 }}>אזכיר לי אחר כך</button>
+              </div>
+            </div>
+          )}
+
+          {/* LOADING */}
+          {step==='loading' && (
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'center', minHeight:300, gap:12, color:S.muted }}>
+              <div style={{ width:20, height:20, border:'2px solid #c8f065', borderTop:'2px solid transparent', borderRadius:'50%', animation:'spin 0.8s linear infinite' }} />
+              טוען נתונים...
+              <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+            </div>
+          )}
+
+          {/* HEADER (list only) */}
+          {step==='list' && (
+            <div style={{ background:S.bg, borderBottom:`1px solid ${S.border}`, padding:'11px 20px', display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                <div style={{ background:S.accent, color:'#0f0f13', width:30, height:30, borderRadius:8, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:700 }}>💪</div>
+                <div>
+                  <div style={{ fontWeight:600, fontSize:12 }}>שימור מתאמנות</div>
+                  <div style={{ color:S.muted, fontSize:10 }}>{fileName}</div>
+                </div>
+                <SyncDot />
+              </div>
+              <div style={{ display:'flex', gap:16 }}>
+                {[{v:total,l:'מתאמנות',c:S.accent},{v:done,l:'טופלו',c:'#4ade80'},{v:total-done,l:'נותרו',c:'#ff6b6b'}].map(({v,l,c})=>(
+                  <div key={l} style={{ textAlign:'center' }}>
+                    <div style={{ fontSize:17, fontWeight:700, color:c }}>{v}</div>
+                    <div style={{ fontSize:10, color:S.muted }}>{l}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                <button onClick={()=>setStep('history')} style={{ background:'rgba(107,181,255,0.1)', color:'#6bb5ff', border:'1px solid rgba(107,181,255,0.25)', padding:'6px 11px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer' }}>📚 היסטוריה ({history.length})</button>
+                <button onClick={exportSummary} style={{ background:'rgba(200,240,101,0.12)', color:S.accent, border:'1px solid rgba(200,240,101,0.3)', padding:'6px 11px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer' }}>📥 ייצוא</button>
+                <button onClick={()=>{setStep('upload');setMembers([]);setMState({});setFileName('');setFilter('all');setCatFilter('all');setCurrentReportId(null);}} style={{ background:'rgba(255,255,255,0.05)', color:S.muted, border:`1px solid ${S.border}`, padding:'6px 11px', borderRadius:8, fontSize:12, cursor:'pointer' }}>↺ דוח חדש</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ maxWidth:740, margin:'0 auto', padding:'22px 18px' }}>
+
+            {/* UPLOAD */}
+            {step==='upload' && (
+              <div>
+                <div style={{ textAlign:'center', marginBottom:22 }}>
+                  <div style={{ background:S.accent, color:'#0f0f13', width:50, height:50, borderRadius:13, display:'flex', alignItems:'center', justifyContent:'center', fontSize:22, margin:'0 auto 10px', fontWeight:700 }}>💪</div>
+                  <div style={{ fontSize:19, fontWeight:700, marginBottom:4 }}>מערכת שימור מתאמנות</div>
+                  <div style={{ color:S.muted, fontSize:12 }}>העלי דוח היעדרויות שבועי מבוסטאפ</div>
+                </div>
+                <div style={{ background:S.surface, borderRadius:10, padding:'11px 16px', marginBottom:14, display:'flex', gap:12, flexWrap:'wrap', justifyContent:'center' }}>
+                  {Object.entries(CAT).filter(([k])=>k!=='none').map(([k,v])=>(
+                    <div key={k} style={{ display:'flex', alignItems:'center', gap:5, fontSize:12 }}>
+                      <div style={{ width:9, height:9, borderRadius:3, background:v.text, opacity:0.8 }} />
+                      <span style={{ color:'#ccc' }}>{v.emoji} {v.label}</span>
+                    </div>
+                  ))}
+                </div>
+                <div onDragOver={e=>{e.preventDefault();setDragging(true);}} onDragLeave={()=>setDragging(false)}
+                  onDrop={e=>{e.preventDefault();setDragging(false);const f=e.dataTransfer.files[0];if(f)processFile(f);}}
+                  onClick={()=>fileRef.current?.click()}
+                  style={{ background:dragging?'rgba(200,240,101,0.06)':S.surface, border:`2px dashed ${dragging?S.accent:'rgba(255,255,255,0.13)'}`, borderRadius:14, padding:'40px 28px', textAlign:'center', cursor:'pointer', transition:'all 0.2s' }}>
+                  <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display:'none' }} onChange={e=>e.target.files[0]&&processFile(e.target.files[0])} />
+                  <div style={{ fontSize:32, marginBottom:8 }}>📂</div>
+                  <div style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>העלאת דוח היעדרויות שבועי</div>
+                  <div style={{ color:S.muted, fontSize:12, marginBottom:13 }}>גרור לכאן קובץ Excel/CSV מבוסטאפ, או לחץ לבחירה</div>
+                  <button onClick={e=>{e.stopPropagation();fileRef.current?.click();}} style={{ background:S.accent, color:'#0f0f13', padding:'9px 22px', borderRadius:8, fontSize:13, fontWeight:700, border:'none', cursor:'pointer' }}>בחר קובץ</button>
+                </div>
+                {history.length > 0 && (
+                  <button onClick={()=>setStep('history')} style={{ marginTop:13, width:'100%', background:S.surface, border:'1px solid rgba(107,181,255,0.25)', color:'#6bb5ff', padding:'10px', borderRadius:10, fontSize:13, fontWeight:600, cursor:'pointer' }}>
+                    📚 צפייה בהיסטוריית דוחות ({history.length} דוחות)
+                  </button>
+                )}
+
+                {/* כפתור אבחון */}
+                <button onClick={async () => {
+                  try {
+                    const meta = await window.db.doc('retention_meta/current').get();
+                    if (!meta.exists) { alert('❌ אין דוח שמור בשרת\n\nצריך להעלות דוח מהמחשב'); return; }
+                    const { currentReportId } = meta.data();
+                    const rep = await window.db.collection('retention_reports').doc(String(currentReportId)).get();
+                    if (!rep.exists) { alert('❌ מזהה דוח לא נמצא: ' + currentReportId); return; }
+                    const d = rep.data();
+                    alert(`✅ נמצא דוח בשרת!\n\nתאריך: ${d.dateLabel}\nקובץ: ${d.fileName}\nמתאמנות: ${d.members?.length || 0}\n\nנסי לרענן את הדף`);
+                  } catch(e) {
+                    alert('❌ שגיאת חיבור לשרת:\n' + e.message);
+                  }
+                }} style={{ marginTop:10, width:'100%', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', color:'#666', padding:'8px', borderRadius:10, fontSize:12, cursor:'pointer' }}>
+                  🔍 בדוק חיבור לשרת
+                </button>
+              </div>
+            )}
+
+            {/* MAPPER */}
+            {step==='map' && (
+              <div>
+                <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:18 }}>
+                  <div style={{ color:S.accent, fontSize:13 }}>📄 {fileName}</div>
+                  <button onClick={()=>setStep('upload')} style={{ marginRight:'auto', background:'none', border:'none', color:S.muted, cursor:'pointer', fontSize:20 }}>×</button>
+                </div>
+                <div style={{ background:S.surface, borderRadius:12, padding:'18px 22px' }}>
+                  <div style={{ color:S.accent, fontSize:14, fontWeight:600, marginBottom:14 }}>🗂 מיפוי עמודות מהקובץ</div>
+                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:11 }}>
+                    {[
+                      {key:'name',     label:'עמודת שם הלקוח *'},
+                      {key:'note',     label:'עמודת הערה / סיבה (אופציונלי)'},
+                      {key:'phone',    label:'עמודת מספר טלפון (אופציונלי)'},
+                      {key:'memberId', label:'עמודת מס׳ לקוח (אופציונלי)'},
+                    ].map(({key,label})=>(
+                      <div key={key}>
+                        <div style={{ fontSize:11, color:S.muted, marginBottom:5 }}>{label}</div>
+                        <select value={colMap[key]} onChange={e=>setColMap(p=>({...p,[key]:e.target.value}))}
+                          style={{ width:'100%', background:S.surface2, border:'1px solid rgba(255,255,255,0.13)', color:S.text, padding:'8px 11px', borderRadius:8, fontSize:12 }}>
+                          <option value="">-- לא נבחר --</option>
+                          {headers.map(h=><option key={h.index} value={String(h.index)}>{h.label}</option>)}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                  <button onClick={applyMapping} style={{ marginTop:14, background:S.accent, color:'#0f0f13', padding:'10px 24px', borderRadius:8, fontSize:13, fontWeight:700, border:'none', cursor:'pointer' }}>
+                    טען מתאמנות ←
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* LIST */}
+            {step==='list' && (
+              <div>
+                <div style={{ marginBottom:12 }}>
+                  <div style={{ display:'flex', justifyContent:'space-between', fontSize:11, color:S.muted, marginBottom:5 }}>
+                    <span>{done} מתוך {total} טופלו</span><span>{pct}%</span>
+                  </div>
+                  <div style={{ background:S.surface2, borderRadius:99, height:5, overflow:'hidden' }}>
+                    <div style={{ height:'100%', background:S.accent, borderRadius:99, width:`${pct}%`, transition:'width 0.4s' }} />
+                  </div>
+                </div>
+                <div style={{ display:'flex', gap:5, marginBottom:11, flexWrap:'wrap' }}>
+                  <button onClick={()=>setCatFilter('all')} style={{ padding:'5px 12px', borderRadius:99, fontSize:11, fontWeight:600, cursor:'pointer', border:`1px solid ${catFilter==='all'?S.accent:'rgba(255,255,255,0.15)'}`, background:catFilter==='all'?'rgba(200,240,101,0.15)':'transparent', color:catFilter==='all'?S.accent:'#aaa' }}>הכל ({total})</button>
+                  {Object.entries(CAT).filter(([k])=>k!=='none').map(([k,v])=>{
+                    const cnt = members.filter(m=>(mState[m.id]?.category||'none')===k).length;
+                    return <button key={k} onClick={()=>setCatFilter(catFilter===k?'all':k)} style={{ padding:'5px 12px', borderRadius:99, fontSize:11, fontWeight:600, cursor:'pointer', border:`1px solid ${catFilter===k?v.text:'rgba(255,255,255,0.12)'}`, background:catFilter===k?v.bg:'transparent', color:catFilter===k?v.text:'#aaa' }}>{v.emoji} {v.label}{cnt>0?` (${cnt})`:''}</button>;
+                  })}
+                </div>
+                <div style={{ marginBottom:11 }}>
+                  <button onClick={()=>setShowTpl(v=>!v)} style={{ background:'none', border:'none', color:S.muted, fontSize:12, cursor:'pointer', display:'flex', alignItems:'center', gap:5 }}>
+                    {showTpl?'▲':'▼'} עריכת תבניות הודעות
+                  </button>
+                  {showTpl && (
+                    <div style={{ background:S.surface, borderRadius:12, padding:'13px 16px', marginTop:7 }}>
+                      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:9 }}>
+                        {Object.keys(DEFAULT_TEMPLATES).map(k=>(
+                          <div key={k}>
+                            <div style={{ fontSize:11, color:S.muted, marginBottom:4 }}>{TEMPLATE_LABELS[k]}</div>
+                            <textarea rows={4} value={templates[k]} onChange={e=>setTemplates(p=>({...p,[k]:e.target.value}))}
+                              style={{ width:'100%', background:S.surface2, border:'1px solid rgba(255,255,255,0.1)', color:S.text, padding:'7px 9px', borderRadius:8, fontSize:12, resize:'vertical', lineHeight:1.6, direction:'rtl', fontFamily:'Heebo, sans-serif' }} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div style={{ display:'flex', gap:7, marginBottom:11, flexWrap:'wrap' }}>
+                  <input type="text" placeholder="🔍 חיפוש שם..." value={search} onChange={e=>setSearch(e.target.value)}
+                    style={{ flex:1, minWidth:140, background:S.surface, border:'1px solid rgba(255,255,255,0.13)', color:S.text, padding:'7px 11px', borderRadius:8, fontSize:12, direction:'rtl' }} />
+                  {[{f:'all',l:'הכל'},{f:'pending',l:'לא טופלו'},{f:'done',l:'טופלו'}].map(({f,l})=>(
+                    <button key={f} onClick={()=>setFilter(f)} style={filter===f?{background:S.accent,color:'#0f0f13',border:`1px solid ${S.accent}`,padding:'6px 11px',borderRadius:8,fontSize:12,fontWeight:700,cursor:'pointer'}:{background:S.surface,color:'#ccc',border:'1px solid rgba(255,255,255,0.13)',padding:'6px 11px',borderRadius:8,fontSize:12,cursor:'pointer'}}>{l}</button>
+                  ))}
+                </div>
+                {filtered.length===0 ? (
+                  <div style={{ textAlign:'center', padding:'36px 0', color:S.muted }}>
+                    <div style={{ fontSize:32, marginBottom:7 }}>🔍</div>
+                    <div style={{ color:S.text, fontSize:13 }}>לא נמצאו מתאמנות</div>
+                  </div>
+                ) : filtered.map((m,i) => renderCard(m, i, mState[m.id], handlers, false))}
+              </div>
+            )}
+
+            {/* HISTORY */}
+            {step==='history' && !historyView && <HistoryListView onBack={()=>setStep(members.length?'list':'upload')} />}
+            {step==='history' && historyView && <HistoryReportView report={historyView} onBack={()=>setHistoryView(null)} />}
+
+          </div>
+
+          {toast && (
+            <div style={{ position:'fixed', bottom:24, left:'50%', transform:'translateX(-50%)', background:S.accent, color:'#0f0f13', padding:'10px 22px', borderRadius:99, fontSize:13, fontWeight:700, zIndex:999, pointerEvents:'none' }}>
+              {toast}
+            </div>
+          )}
         </div>
       );
     }
